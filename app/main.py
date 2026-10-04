@@ -1,4 +1,4 @@
-"""FastAPI 入口：提交迁移清单 / 查询当前版本 / 检查点与整库恢复 / 多库批次发布。"""
+"""FastAPI 入口：提交迁移清单 / 查询当前版本 / 检查点与整库恢复 / 多库批次发布 / 双人审核发布单。"""
 
 from __future__ import annotations
 
@@ -26,6 +26,16 @@ from .engine import (
     status,
 )
 from .manifest import MigrationManifest
+from .release import (
+    DigestMismatch,
+    ReleaseError,
+    ReleaseService,
+    ReleaseStateError,
+    ReleaseStore,
+    SelfReviewForbidden,
+    UnknownCredential,
+    UnknownRelease,
+)
 
 settings = load_settings()
 registry = DatabaseRegistry()
@@ -34,6 +44,10 @@ batch_journal = BatchJournal(settings.batch_dir)
 batches = BatchCoordinator(settings, registry, checkpoints, batch_journal)
 # 重启后发现未结束批次：标为未决，不自动重放 SQL、不宣称成功。
 batch_journal.mark_unfinished_undecided()
+release_store = ReleaseStore(settings.release_dir)
+releases = ReleaseService(settings, release_store, batches)
+# 重启后发现执行中断的发布单：标为未决，不重放 SQL、不虚报成功。
+release_store.mark_unfinished_undecided()
 
 app = FastAPI(title="SQLite Migration Backend", version="1.0.0")
 
@@ -76,6 +90,24 @@ async def _migration_error_handler(_: Request, exc: MigrationError) -> JSONRespo
     elif isinstance(exc, UnknownBatch):
         status_code = 404
         code = "unknown_batch"
+    elif isinstance(exc, UnknownRelease):
+        status_code = 404
+        code = "unknown_release"
+    elif isinstance(exc, UnknownCredential):
+        status_code = 401
+        code = "unknown_credential"
+    elif isinstance(exc, SelfReviewForbidden):
+        status_code = 403
+        code = "self_review_forbidden"
+    elif isinstance(exc, DigestMismatch):
+        status_code = 409
+        code = "digest_mismatch"
+    elif isinstance(exc, ReleaseStateError):
+        status_code = 409
+        code = "release_state_conflict"
+    elif isinstance(exc, ReleaseError):
+        status_code = 422
+        code = "invalid_release"
     else:
         status_code = 400
         code = "migration_error"
@@ -95,6 +127,28 @@ def _resolve(alias: str):
     return db_path
 
 
+def _review_mode_closed() -> JSONResponse:
+    """审核模式启用时，直接迁移/批次/恢复入口关闭，避免绕过审批。"""
+    return JSONResponse(
+        status_code=403,
+        content={
+            "detail": "review mode enabled: use /releases workflow instead",
+            "code": "review_mode_required",
+        },
+    )
+
+
+def _identity(request: Request):
+    """凭据确认身份；失败时返回 401 响应。"""
+    try:
+        return releases.identify(request.headers.get("x-reviewer-token"))
+    except UnknownCredential as exc:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": str(exc), "code": "unknown_credential"},
+        )
+
+
 @app.get("/health")
 async def health() -> dict:
     return {"ok": True, "aliases": sorted(settings.aliases)}
@@ -110,6 +164,8 @@ async def get_version(alias: str):
 
 @app.post("/databases/{alias}/migrate")
 async def migrate(alias: str, request: Request):
+    if settings.review_mode:
+        return _review_mode_closed()
     resolved = _resolve(alias)
     if isinstance(resolved, JSONResponse):
         return resolved
@@ -160,6 +216,8 @@ async def list_checkpoints(alias: str):
 
 @app.post("/databases/{alias}/restore")
 async def restore_checkpoint(alias: str, request: Request):
+    if settings.review_mode:
+        return _review_mode_closed()
     resolved = _resolve(alias)
     if isinstance(resolved, JSONResponse):
         return resolved
@@ -189,6 +247,8 @@ async def restore_checkpoint(alias: str, request: Request):
 @app.post("/batches")
 async def submit_batch(request: Request):
     """多库关联发布：统一准备、按序迁移、失败逆序补偿。"""
+    if settings.review_mode:
+        return _review_mode_closed()
     raw = await request.body()
     if len(raw) > MAX_REQUEST_BYTES:
         return JSONResponse(
@@ -220,3 +280,97 @@ async def get_batch(batch_id: str):
             content={"detail": f"unknown batch: {batch_id}", "code": "unknown_batch"},
         )
     return detail
+
+
+class ApproveRequest(BaseModel):
+    digest: str = Field(min_length=1)
+
+
+@app.post("/releases", status_code=201)
+async def create_release(request: Request):
+    """提交发布单：保存有序库、预期版本、完整清单与原始 SQL，生成 ID 与内容摘要。"""
+    person = _identity(request)
+    if isinstance(person, JSONResponse):
+        return person
+    raw = await request.body()
+    if len(raw) > MAX_REQUEST_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": f"request body too large (> {MAX_REQUEST_BYTES} bytes)"},
+        )
+    try:
+        plan = BatchRequest.model_validate_json(raw)
+    except ValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(exc.errors()), "code": "invalid_release"},
+        )
+    try:
+        order = releases.create(person, plan)
+    except ReleaseError as exc:
+        code = "unknown_alias" if str(exc).startswith("unknown alias") else "invalid_release"
+        return JSONResponse(
+            status_code=404 if code == "unknown_alias" else 422,
+            content={"detail": str(exc), "code": code},
+        )
+    return order
+
+
+@app.get("/releases")
+async def list_releases() -> dict:
+    return {"releases": release_store.list()}
+
+
+@app.get("/releases/{release_id}")
+async def get_release(release_id: str):
+    order = release_store.get(release_id)
+    if order is None:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"unknown release: {release_id}", "code": "unknown_release"},
+        )
+    return order
+
+
+@app.post("/releases/{release_id}/approve")
+async def approve_release(release_id: str, request: Request):
+    """他人批准：必须携带所查看的内容摘要，拒绝自我审核与摘要不符。"""
+    person = _identity(request)
+    if isinstance(person, JSONResponse):
+        return person
+    raw = await request.body()
+    try:
+        payload = ApproveRequest.model_validate_json(raw)
+    except ValidationError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": jsonable_encoder(exc.errors()), "code": "invalid_approve_request"},
+        )
+    return releases.approve(release_id, person, payload.digest)
+
+
+@app.post("/releases/{release_id}/reject")
+async def reject_release(release_id: str, request: Request):
+    person = _identity(request)
+    if isinstance(person, JSONResponse):
+        return person
+    return releases.reject(release_id, person)
+
+
+@app.post("/releases/{release_id}/cancel")
+async def cancel_release(release_id: str, request: Request):
+    """作者撤销未开始执行的单。"""
+    person = _identity(request)
+    if isinstance(person, JSONResponse):
+        return person
+    return releases.cancel(release_id, person)
+
+
+@app.post("/releases/{release_id}/execute")
+async def execute_release(release_id: str, request: Request):
+    """只提交发布单 ID，按批准方案执行；重复执行返回已有结果。"""
+    person = _identity(request)
+    if isinstance(person, JSONResponse):
+        return person
+    status_code, payload = releases.execute(release_id)
+    return JSONResponse(status_code=status_code, content=payload)

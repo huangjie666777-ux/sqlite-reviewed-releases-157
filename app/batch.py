@@ -247,8 +247,12 @@ class BatchCoordinator:
         self._journal = journal
         self._batch_lock = threading.Lock()
 
-    def execute(self, request: BatchRequest):
-        """执行批次，返回 (HTTP 状态码, 响应体)。业务异常不泄漏为 500。"""
+    def execute(self, request: BatchRequest, on_batch_created=None):
+        """执行批次，返回 (HTTP 状态码, 响应体)。业务异常不泄漏为 500。
+
+        on_batch_created 若提供，在批次 ID 落库后立即回调，便于调用方
+        （如发布单）在任何异常发生前持久化批次关联。
+        """
         unknown = [d.alias for d in request.databases if d.alias not in self._settings.aliases]
         if unknown:
             return 404, {
@@ -279,6 +283,8 @@ class BatchCoordinator:
             ]
         }
         batch_id = self._journal.create_batch(plan)
+        if on_batch_created is not None:
+            on_batch_created(batch_id)
 
         # 全局批次锁保证批次互斥；别名单调加锁避免与单库操作死锁。
         with self._batch_lock:
@@ -392,7 +398,8 @@ class BatchCoordinator:
                     expected_version=state["after_version"],
                     lock=self._registry.lock_for(alias),
                 )
-            except MigrationError as restore_exc:
+            except Exception as restore_exc:
+                # 文件读写等任何异常都不能中断其余库的恢复；保留真实错误。
                 state["status"] = "restore_failed"
                 state["error"] = str(restore_exc)
                 journal.add_event(

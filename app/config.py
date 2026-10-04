@@ -27,6 +27,9 @@ class Settings:
     aliases: dict[str, Path]
     checkpoint_dir: Path
     batch_dir: Path
+    release_dir: Path
+    review_mode: bool
+    reviewers: dict[str, str]
 
 
 def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
@@ -70,4 +73,40 @@ def load_settings(path: str | os.PathLike[str] | None = None) -> Settings:
     for alias, db_path in aliases.items():
         if db_path == batch_dir or batch_dir in db_path.parents:
             raise ValueError(f"batch_dir must not contain database files: {alias}")
-    return Settings(aliases=aliases, checkpoint_dir=checkpoint_dir, batch_dir=batch_dir)
+    # 发布单存储目录同样在应用库之外；默认 <配置目录>/releases，可用
+    # aliases.json 的 "release_dir" 或 MIGRATION_RELEASE_DIR 覆盖。
+    raw_release = os.environ.get("MIGRATION_RELEASE_DIR") or raw.get("release_dir")
+    if raw_release:
+        release_dir = Path(raw_release)
+        if not release_dir.is_absolute():
+            release_dir = cfg_path.parent / release_dir
+    else:
+        release_dir = cfg_path.parent / "releases"
+    release_dir = release_dir.resolve()
+    for alias, db_path in aliases.items():
+        if db_path == release_dir or release_dir in db_path.parents:
+            raise ValueError(f"release_dir must not contain database files: {alias}")
+    # 双人审核模式：aliases.json 的 "review_mode" 或 MIGRATION_REVIEW_MODE 启用；
+    # "reviewers" 配置 凭据 -> 人员 映射，凭据即身份，不信任请求内署名。
+    raw_mode = os.environ.get("MIGRATION_REVIEW_MODE")
+    if raw_mode is None:
+        review_mode = bool(raw.get("review_mode", False))
+    else:
+        review_mode = raw_mode.strip().lower() in ("1", "true", "yes", "on")
+    reviewers: dict[str, str] = {}
+    for token, person in (raw.get("reviewers") or {}).items():
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError(f"invalid reviewer credential: {token!r}")
+        if not isinstance(person, str) or not person.strip():
+            raise ValueError(f"invalid reviewer name for credential: {token!r}")
+        reviewers[token] = person
+    if review_mode and len(reviewers) < 2:
+        raise ValueError("review_mode requires at least two reviewers in aliases.json")
+    return Settings(
+        aliases=aliases,
+        checkpoint_dir=checkpoint_dir,
+        batch_dir=batch_dir,
+        release_dir=release_dir,
+        review_mode=review_mode,
+        reviewers=reviewers,
+    )
